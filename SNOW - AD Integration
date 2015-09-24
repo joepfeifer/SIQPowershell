@@ -1,0 +1,178 @@
+Import-Module activedirectory
+Import-module gmail.ps
+
+$passwd = ConvertTo-SecureString 't3$T!NGg2' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential ('exchange@iqnavigator.com', $passwd)
+$gmail = New-GmailSession $cred
+$passwd
+
+#Remove Messages not from SupportIQ 
+Get-Message $gmail * | where {$_.from -notmatch "SupportIQ" -and $_.from -notmatch "Joe Pfeifer"} | Remove-Message
+
+#$gmail | Count-Message
+$msgs = get-Message $gmail * | Receive-Message
+foreach ($msg in $msgs) {
+
+   #### Employee Termination ####
+   if($msg.Subject -eq "Employee Termination") {
+
+   $msg
+   $body = $msg.body
+   $username = $body.substring($body.IndexOf("Username:")+10)
+   $username = $username.substring(0,$username.IndexOf("</div>"))
+   #get-aduser -Identity $username
+   $email = "$username@iqnavigator.com"
+   $date = (get-date).ToShortDateString()
+   $termpassword = ConvertTo-SecureString 'Goodbye2u' -AsPlainText -Force
+   Get-ADPrincipalGroupMembership $username | foreach $_ {Remove-ADGroupMember $_ -Members $username -confirm:$false}
+   
+   #If Exchange user doesn't have access to reset users password, remove groups, move user, then send a ticket to tech360 to investigate
+   Try {
+    Set-aduser $username -Description "Disabled Network Access, $date - SYS" -Department $null -Manager $Null -Replace @{msExchHideFromAddressLists=$true}
+    Set-ADAccountPassword $username -NewPassword $termpassword
+    Get-ADUser $username | Move-ADObject -TargetPath "OU=Former Employees,OU=_Disabled Accounts,DC=denver,DC=iqxchange,DC=com"
+   } Catch [Microsoft.ActiveDirectory.Management.ADException]{
+    $param = @{
+       SmtpServer = 'smtp.gmail.com'
+       Port = 587
+       UseSsl = $true
+       Credential = $cred
+       From = 'exchange@iqnavigator.com'
+       To = 'tech360@iqnavigator.com'
+       Subject = 'Termination script failed for ' + $username + ': Access Denied'
+     }
+     Send-MailMessage @param
+   }
+   
+   #Find any computer in AD that matches the users username and move it the disabled computers OU
+   Get-ADComputer -Filter * | Where-Object {$_.Name -match $username} | Move-ADObject -TargetPath "OU=Former Employee Computers,OU=_Disabled Accounts,DC=denver,DC=iqxchange,DC=com"
+   
+   #Uncomment below line to disable the users account
+   Get-ADUser $username | Disable-ADAccount
+  
+   $param = @{
+       SmtpServer = 'smtp.gmail.com'
+       Port = 587
+       UseSsl = $true
+       Credential = $cred
+       From = 'exchange@iqnavigator.com'
+       To = 'supportiq@iqn.com'
+       Subject = 'Tech360 Termination ' + $username
+   }
+   Send-MailMessage @param
+
+   #Delete email message in gmail
+   Remove-Message -Session $gmail -message $msg
+   }
+   
+   #Function to parse fields from the email body
+   function getEmailField($msg, $field){
+    $value = ''
+    $pattern = "(?<=" + $field + "\:\s).*"
+    return ([regex]::matches($msg, $pattern) | %{$_.value.substring(0,$_.value.indexOf("</div>"))})
+    }
+
+   #### Employee Onboarding ####
+   if($msg.Subject -eq "New Employee") {
+   
+      # Set variables
+      $body = $msg.Body
+      $firstname = (getEmailField -msg $body -field "First Name").trim()
+      $lastname = (getEmailField -msg $body -field "Last Name").trim()
+      $fullname = (getEmailField -msg $body -field 'Full Name').trim()
+      $displayname = ($lastname + ", " + $firstname)
+      $username = (getEmailField -msg $body -field 'Username').trim().toLower()
+      $email = ($username + "@iqnavigator.com").trim().toLower()
+      $man = (getEmailField -msg $body -field "Manager").trim()
+      $dept = (getEmailField -msg $body -field "Department").trim()
+      $dept = $dept.replace("amp;","")
+      $title = (getEmailField -msg $body -field "Title").trim()
+      $adgroups = (getEmailField -msg $body -field "Active Directory DLs").trim()
+      $employeetype = (getEmailField -msg $body -field "Employee Type").trim()
+      $location = (getEmailField -msg $body -field "Location").trim()
+      $lastday = (getEmailField -msg $body -field "Last Day").trim()
+      $password = ($dept.Substring(0,3) + "." + $firstname.Substring(0,2) + $lastname.Substring(0,2))
+      $securepassword = ConvertTo-SecureString $password -AsPlainText -force
+      $manager = Get-ADUser -f {(SamAccountName -like $man) -and (ObjectClass -eq "user")}
+      
+      #Determine path depending on usertype & $location
+        
+      If ($location -like 'Corporate Headquarters - Denver') {
+        $path = "OU=Users,OU=HQ,OU=_North America,DC=denver,DC=iqxchange,DC=com"
+      } ElseIf ($location -like 'EMEA - Remote') {
+        $path = "OU=Users,OU=Remote,OU=_EMEA,DC=denver,DC=iqxchange,DC=com"
+      } ElseIf ($location -like 'European Headquarters - London') {
+        $path = "OU=Users,OU=London,OU=_EMEA,DC=denver,DC=iqxchange,DC=com"
+      } ElseIf ($location -like 'North America - Remote') {
+        $path = "OU=Users,OU=Remote,OU=_North America,DC=denver,DC=iqxchange,DC=com"
+      } ElseIf ($location -like 'Westminster Office (US)') {
+        $path = "OU=Developer Users,OU=Users,OU=Westminster,OU=_North America,DC=denver,DC=iqxchange,DC=com"
+      } ElseIf ($employeetype -like "Contractor") {
+        $path = "OU=Users,OU=_Contract Employees,DC=denver,DC=iqxchange,DC=com"
+      }
+
+      #Check to see if already an employee by searching first and last name
+      if (Get-ADUser -Filter {(sn -like $lastname) -and (givenname -like $firstname)}) {
+         Get-ADUser -Filter {(sn -like $lastname) -and (givenname -like $firstname)}
+      } else {
+
+      # Else Create new user from variables
+        New-ADUser -Name $displayname -UserPrincipalName $email -SamAccountName $username -GivenName $firstname -Surname $lastname `
+        -Company "IQNavigator" -AccountPassword $securepassword -Department $dept -Manager $manager -OtherAttributes @{'proxyAddresses' = "SMTP:$email"}  `
+        -title $title -EmailAddress $email -DisplayName $displayname -Path $path -ScriptPath "logon.bat" -Office $location -Enabled $true
+        
+        # Add User to AD Groups
+        $adgroups.Split("{,}") | foreach {Add-ADGroupMember -identity $_.trim() -Members $username}
+
+        #If Contractor, set Expiration Date on AD Account
+        if($lastday -ne "") {
+          Set-ADUser $username -AccountExpirationDate $lastday
+        }
+        
+        $param = @{
+            SmtpServer = 'smtp.gmail.com'
+            Port = 587
+            UseSsl = $true
+            Credential = $cred
+            From = 'exchange@iqnavigator.com'
+            To = 'supportiq@iqn.com'
+            Subject = 'Tech360 Networking ' + $fullname
+        }
+        Send-MailMessage @param
+        
+        Remove-Message -Session $gmail -message $msg
+        }
+
+      #Will not Remove-Message if the user is found in AD
+    }
+
+    #### Move HR Docs to Employee Folder ####
+    if($msg.Subject.StartsWith("PAN") -or $msg.Subject.StartsWith("SEPA") -or $msg.Subject.StartsWith("Compa Val")) {
+        $subject = $msg.Subject
+        $fullname = $subject.substring($subject.indexOf('for')+4)
+        $fullname = $fullname.Substring(0,$fullname.indexOf('has')-1).trim()
+        #$fullname
+        $fullnameshort = $fullname.Substring(0,$fullname.IndexOf(',')+3)
+        #$fullnameshort
+
+        $folders = Get-ChildItem -Path "Z:\Human Resources\Private\~~EMPLOYEE RECORDS\Active Employee Folders"
+        foreach ($folder in $folders | where {$_.name -contains $fullname -or $_.name -contains $fullnameshort}) {
+            #$folder
+            if ($folder) {
+                $path = $folder.FullName + "\" + $msg.Attachments.FileName
+                #Save-Attachment -Message $msg -Path $path
+                "Found Folder"
+                $msg.Attachments.Save($path)
+                $path
+            }
+            else {
+                $path = "Z:\Human Resources\Private\~~EMPLOYEE RECORDS\Employee Folders\" + $fullname + "\" + $msg.Attachments.FileName
+                "Did Not Find Folder"
+                $msg.Attachments.Save($path)
+                $path
+            }
+        }
+
+        Remove-Message -Session $gmail -message $msg
+    }
+}
